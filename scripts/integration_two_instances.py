@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from scripts.make_demo_fastq import main as make_demo  # noqa: E402
+from scripts.make_merge_demo import main as make_merge_demo  # noqa: E402
 
 
 def free_port() -> int:
@@ -163,7 +164,73 @@ def main() -> int:
     procs = [a, b]
 
     try:
-        print("[2] submit 8 lanes; work must be split across both instances")
+        print("[2] overlap merge over a snapshot frozen before other lanes")
+        merge_fixture = data_dir / "merge-fixture"
+        make_merge_demo(str(merge_fixture), pairs=2000)
+        mr1, mr2 = (merge_fixture / "R1.fastq.gz",
+                    merge_fixture / "R2.fastq.gz")
+        merge_barcodes = [
+            {"sample_id": "sampleA", "barcode_r1": "AAAAAAAA",
+             "barcode_r2": "CCCCCCCC"},
+            {"sample_id": "sampleB", "barcode_r1": "GGGGGGGG",
+             "barcode_r2": "TTTTTTTT"},
+        ]
+        merge_lanes = ["mergeLane1", "mergeLane2"]
+        for lane in merge_lanes:
+            boundary, body = multipart(lane, merge_barcodes, mr1, mr2)
+            code, resp = http("POST", f"{BASE_B}/jobs",
+                              raw_path=(boundary, body))
+            assert code == 201, (code, resp)
+            assert wait_job(BASE_B, json.loads(resp)["job"]["job_id"])[
+                "status"] == "published"
+        # Snapshot now contains exactly the two merge lanes.
+        code, msnap = http("POST", f"{BASE_A}/snapshots")
+        merge_snap = json.loads(msnap)["snapshot_id"]
+        assert json.loads(msnap)["lanes"] == merge_lanes
+        # A lane published after the snapshot must not enter the merge.
+        boundary, body = multipart("mergeLaneLate", merge_barcodes, mr1, mr2)
+        code, resp = http("POST", f"{BASE_A}/jobs", raw_path=(boundary, body))
+        assert wait_job(BASE_A, json.loads(resp)["job"]["job_id"])[
+            "status"] == "published"
+
+        req = json.dumps({"snapshot_id": merge_snap,
+                          "sample_id": "sampleA"}).encode()
+        code, resp = http("POST", f"{BASE_A}/merge/jobs", data=req)
+        assert code == 201, (code, resp)
+        merge_id = json.loads(resp)["job"]["merge_job_id"]
+        # Re-submitting the same input is idempotent.
+        code, resp = http("POST", f"{BASE_B}/merge/jobs", data=req)
+        assert code == 201 and json.loads(resp)["reused"] is True
+        deadline = time.time() + 120
+        mrow = None
+        while time.time() < deadline:
+            code, body = http("GET", f"{BASE_A}/merge/jobs/{merge_id}")
+            mrow = json.loads(body)
+            if mrow["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.3)
+        assert mrow["status"] == "completed", mrow
+        assert mrow["merged_count"] > 0 and mrow["unmerged_count"] > 0
+        assert (mrow["merged_count"] + mrow["unmerged_count"]
+                == mrow["total_pairs"])
+        assert mrow["lanes"] == merge_lanes
+        print(f"    merged={mrow['merged_count']} "
+              f"unmerged={mrow['unmerged_count']} total={mrow['total_pairs']}")
+        code, blob = http(
+            "GET", f"{BASE_B}/merge/jobs/{merge_id}/download")
+        assert code == 200 and blob[:2] == b"\x1f\x8b" and len(blob) > 0
+        import gzip as _gzip
+        import io as _io
+        with _gzip.open(_io.BytesIO(blob)) as g:
+            merged_lines = g.read().splitlines()
+        assert len(merged_lines) == 4 * mrow["merged_count"]
+        code, _ = http("POST", f"{BASE_A}/merge/jobs",
+                       data=json.dumps({"snapshot_id": "nope",
+                                        "sample_id": "sampleA"}).encode())
+        assert code == 404
+        print("    merged gzip verified; late lane excluded; API stays live")
+
+        print("[3] submit 8 lanes; work must be split across both instances")
         job_ids = []
         for i in range(8):
             boundary, body = multipart(f"laneIT{i}", barcodes, r1, r2)
@@ -180,7 +247,7 @@ def main() -> int:
         print(f"    {len(distinct)} distinct owners across 8 lanes: {distinct}")
         assert len(distinct) == 2, "both instances must claim jobs"
 
-        print("[3] new submission/query/download stay responsive during load")
+        print("[4] new submission/query/download stay responsive during load")
         code, _ = http("GET", f"{BASE_A}/health")
         assert code == 200
         boundary, body = multipart("laneITExtra", barcodes, r1, r2)
@@ -201,7 +268,7 @@ def main() -> int:
         print("    laneIT0 counts:", counts)
         assert counts["__quarantine__"] == 2
 
-        print("[4] snapshot fixes the lane list (later lane excluded)")
+        print("[5] snapshot fixes the lane list (later lane excluded)")
         code, snap = http("POST", f"{BASE_A}/snapshots")
         snap_id = json.loads(snap)["snapshot_id"]
         before = set(json.loads(snap)["lanes"])
@@ -213,7 +280,7 @@ def main() -> int:
         assert set(json.loads(snap2)["lanes"]) == before
         print(f"    snapshot keeps {len(before)} lanes; later lane excluded")
 
-        print("[5] duplicate lane reuses task; different input rejected (409)")
+        print("[6] duplicate lane reuses task; different input rejected (409)")
         boundary, body = multipart("laneIT0", barcodes, r1, r2)
         code, resp = http("POST", f"{BASE_B}/jobs", raw_path=(boundary, body))
         assert code == 201 and json.loads(resp)["reused"] is True
@@ -225,12 +292,12 @@ def main() -> int:
         signalled = [stop(p) for p in procs]
 
     if not all(signalled):
-        print("\n[6] SKIPPED hard-crash section: sandbox denies process signals")
+        print("\n[7] SKIPPED hard-crash section: sandbox denies process signals")
         print("    Crash recovery is covered by: pytest tests/test_failure_and_recovery.py")
         print("\nINTEGRATION CHECKS PASSED (crash section skipped here)")
         return 0
 
-    print("[6] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
+    print("[7] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
     c = start_instance(PORT_A, data_dir)
     try:
         boundary, body = multipart("laneCrash", barcodes, r1, r2)

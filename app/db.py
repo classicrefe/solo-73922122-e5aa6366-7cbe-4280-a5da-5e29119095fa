@@ -68,6 +68,25 @@ CREATE TABLE IF NOT EXISTS snapshot_lanes (
     seq         INTEGER NOT NULL,
     PRIMARY KEY (snapshot_id, lane)
 );
+
+CREATE TABLE IF NOT EXISTS merge_jobs (
+    merge_job_id    TEXT PRIMARY KEY,
+    snapshot_id     TEXT NOT NULL,
+    sample_id       TEXT NOT NULL,
+    lanes_json      TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN
+                        ('queued','processing','completed','failed')),
+    output_file     TEXT,
+    merged_count    INTEGER NOT NULL DEFAULT 0,
+    unmerged_count  INTEGER NOT NULL DEFAULT 0,
+    total_pairs     INTEGER NOT NULL DEFAULT 0,
+    error           TEXT,
+    instance_id     TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    heartbeat_at    TEXT,
+    UNIQUE (snapshot_id, sample_id)
+);
 """
 
 _local = threading.local()
@@ -288,3 +307,84 @@ def list_snapshots() -> list[dict[str, Any]]:
         for r in get_conn().execute(
             "SELECT * FROM snapshots ORDER BY created_at").fetchall()
     ]
+
+
+# ---------- overlap-merge jobs ----------
+
+def create_merge_job(job_id: str, snapshot_id: str, sample_id: str,
+                     lanes: list[str]) -> None:
+    with tx() as conn:
+        conn.execute(
+            """INSERT INTO merge_jobs (merge_job_id, snapshot_id, sample_id,
+                                       lanes_json, status, created_at,
+                                       updated_at, heartbeat_at)
+               VALUES (?,?,?,?,'queued',?,?,NULL)""",
+            (job_id, snapshot_id, sample_id, json.dumps(lanes),
+             _now(), _now()),
+        )
+
+
+def get_merge_job(job_id: str) -> sqlite3.Row | None:
+    return get_conn().execute(
+        "SELECT * FROM merge_jobs WHERE merge_job_id=?", (job_id,)
+    ).fetchone()
+
+
+def get_merge_job_by_input(snapshot_id: str,
+                           sample_id: str) -> sqlite3.Row | None:
+    return get_conn().execute(
+        "SELECT * FROM merge_jobs WHERE snapshot_id=? AND sample_id=?",
+        (snapshot_id, sample_id)).fetchone()
+
+
+def list_merge_jobs() -> list[sqlite3.Row]:
+    return get_conn().execute(
+        "SELECT * FROM merge_jobs ORDER BY created_at").fetchall()
+
+
+def claim_next_merge_job(instance_id: str) -> sqlite3.Row | None:
+    with tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM merge_jobs WHERE status='queued' "
+            "ORDER BY created_at LIMIT 1").fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            """UPDATE merge_jobs SET status='processing', instance_id=?,
+                                     updated_at=?, heartbeat_at=?
+               WHERE merge_job_id=?""",
+            (instance_id, _now(), _now(), row["merge_job_id"]),
+        )
+    return get_merge_job(row["merge_job_id"])
+
+
+def merge_heartbeat(job_id: str, instance_id: str) -> None:
+    get_conn().execute(
+        "UPDATE merge_jobs SET heartbeat_at=? "
+        "WHERE merge_job_id=? AND instance_id=?",
+        (_now(), job_id, instance_id),
+    )
+
+
+def mark_merge_failed(job_id: str, instance_id: str, error: str) -> None:
+    with tx() as conn:
+        conn.execute(
+            """UPDATE merge_jobs SET status='failed', error=?, updated_at=?
+               WHERE merge_job_id=? AND instance_id=?""",
+            (error[:2000], _now(), job_id, instance_id),
+        )
+
+
+def complete_merge_job(job_id: str, instance_id: str, output_file: str,
+                       merged_count: int, unmerged_count: int,
+                       total_pairs: int) -> None:
+    """Publish merge metadata in one transaction after the file is in place."""
+    with tx() as conn:
+        conn.execute(
+            """UPDATE merge_jobs SET status='completed', output_file=?,
+                                     merged_count=?, unmerged_count=?,
+                                     total_pairs=?, error=NULL, updated_at=?
+               WHERE merge_job_id=? AND instance_id=?""",
+            (output_file, merged_count, unmerged_count, total_pairs,
+             _now(), job_id, instance_id),
+        )

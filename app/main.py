@@ -13,8 +13,9 @@ from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from pydantic import BaseModel
 
-from . import config, db, processing
+from . import config, db, merging, processing
 from .worker import JobWorker, new_instance_id
 
 _IO_CHUNK = 1024 * 1024
@@ -29,6 +30,11 @@ _LANE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _SAMPLE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _BASE_RE = re.compile(r"^[ACGT]{%d}$" % config.BARCODE_LEN)
 _RESERVED_PREFIX = "__"
+
+
+class MergeRequest(BaseModel):
+    snapshot_id: str
+    sample_id: str
 
 
 def _validate_barcodes(raw: str) -> list[dict[str, str]]:
@@ -112,6 +118,7 @@ def _safe_published_path(path_str: str) -> Path:
 async def lifespan(app: FastAPI):
     db.init_db()
     notes = processing.recover_on_startup()
+    notes.extend(merging.recover_merges_on_startup())
     for note in notes:
         log.info("startup recovery: %s", note)
     instance_id = new_instance_id()
@@ -127,15 +134,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Sequencing Lane Demultiplexing API",
-    version="1.0.0",
+    title="Sequencing Lane Demultiplexing & Read-Merging API",
+    version="1.1.0",
     description=(
         "Submit a lane with up to 8 dual-index samples and paired gzip "
         "FASTQ files. Reads are assigned by combined R1+R2 8-base barcodes "
         "with at most one substitution and a unique candidate; everything "
         "else is quarantined. Barcodes and qualities are trimmed on "
         "assignment. Published lanes, per-sample files, quarantine files and "
-        "counts become visible atomically."
+        "counts become visible atomically. Snapshots freeze the lane list; "
+        "POST /merge/jobs merges a snapshot sample's overlapping paired-end "
+        "reads (>=12 bp unique ungapped overlap, <=5% mismatches) into one "
+        "gzip FASTQ of single-end reads."
     ),
     lifespan=lifespan,
 )
@@ -153,8 +163,12 @@ def health():
         "status": "ok",
         "instance_id": app.state.instance_id,
         "current_job": worker.current_job,
+        "current_merge_job": worker.current_merge_job,
         "queued_jobs": db.get_conn().execute(
             "SELECT COUNT(*) c FROM jobs WHERE status='queued'").fetchone()["c"],
+        "queued_merge_jobs": db.get_conn().execute(
+            "SELECT COUNT(*) c FROM merge_jobs WHERE status='queued'"
+        ).fetchone()["c"],
     }
 
 
@@ -397,3 +411,105 @@ def snapshot_quarantine(snapshot_id: str, mate: str):
         headers={**headers,
                  "content-disposition":
                      f'attachment; filename="quarantine.{mate}.fastq.gz"'})
+
+
+# ---------------- overlap merge jobs ----------------
+
+def _merge_public(row) -> dict[str, Any]:
+    import json as _json
+    out = {k: row[k] for k in row.keys()}
+    out["lanes"] = _json.loads(row["lanes_json"])
+    out.pop("lanes_json", None)
+    out["download_available"] = (
+        row["status"] == "completed"
+        and row["output_file"] is not None
+        and Path(row["output_file"]).is_file())
+    return out
+
+
+@app.post("/merge/jobs", status_code=201)
+def submit_merge_job(req: MergeRequest):
+    """Queue an overlap merge for one sample across a snapshot's fixed lanes."""
+    if not _SAMPLE_RE.match(req.sample_id or ""):
+        raise HTTPException(
+            400, "sample_id must match [A-Za-z0-9_.-]{1,64}")
+    snap = db.get_snapshot(req.snapshot_id)
+    if snap is None:
+        raise HTTPException(404, "snapshot not found")
+    lanes = snap["lanes"]
+    conn = db.get_conn()
+
+    # The sample must be published in at least one frozen lane; lanes where
+    # it is absent are simply skipped (same semantics as snapshot downloads).
+    present = [
+        lane for lane in lanes
+        if conn.execute(
+            "SELECT 1 FROM lane_counts WHERE lane=? AND sample_id=?",
+            (lane, req.sample_id)).fetchone() is not None
+    ]
+    if not present:
+        raise HTTPException(
+            404,
+            f"sample {req.sample_id!r} exists in none of the snapshot lanes")
+
+    existing = db.get_merge_job_by_input(req.snapshot_id, req.sample_id)
+    if existing is not None:
+        # Idempotent submission: same snapshot+sample always returns the job.
+        return {"reused": True, "job": _merge_public(existing)}
+
+    job_id = uuid.uuid4().hex
+    try:
+        db.create_merge_job(job_id, req.snapshot_id, req.sample_id, present)
+    except Exception:
+        # Lost the UNIQUE(snapshot_id, sample_id) race against a sibling.
+        rival = db.get_merge_job_by_input(req.snapshot_id, req.sample_id)
+        if rival is not None:
+            return {"reused": True, "job": _merge_public(rival)}
+        raise HTTPException(409, "merge job already exists for this input")
+    return {"reused": False, "job": _merge_public(db.get_merge_job(job_id))}
+
+
+@app.get("/merge/jobs")
+def list_merge_jobs():
+    return [_merge_public(r) for r in db.list_merge_jobs()]
+
+
+@app.get("/merge/jobs/{merge_job_id}")
+def get_merge_job(merge_job_id: str):
+    row = db.get_merge_job(merge_job_id)
+    if row is None:
+        raise HTTPException(404, "merge job not found")
+    return _merge_public(row)
+
+
+@app.post("/merge/jobs/{merge_job_id}/retry")
+def retry_merge_job(merge_job_id: str):
+    row = db.get_merge_job(merge_job_id)
+    if row is None:
+        raise HTTPException(404, "merge job not found")
+    if row["status"] != "failed":
+        raise HTTPException(
+            409, f"merge job is {row['status']}, only failed jobs retry")
+    with db.tx() as conn:
+        conn.execute(
+            """UPDATE merge_jobs SET status='queued', error=NULL,
+                                    instance_id=NULL, updated_at=?,
+                                    heartbeat_at=NULL
+               WHERE merge_job_id=?""",
+            (db.utcnow(), merge_job_id))
+    return _merge_public(db.get_merge_job(merge_job_id))
+
+
+@app.get("/merge/jobs/{merge_job_id}/download")
+def download_merge_job(merge_job_id: str):
+    row = db.get_merge_job(merge_job_id)
+    if row is None:
+        raise HTTPException(404, "merge job not found")
+    if row["status"] != "completed" or not row["output_file"]:
+        raise HTTPException(
+            409, f"merge job is {row['status']}; nothing to download")
+    path = _safe_published_path(row["output_file"])
+    return FileResponse(
+        path, media_type="application/gzip",
+        filename=(f"{row['snapshot_id']}.{row['sample_id']}"
+                  ".merged.fastq.gz"))
